@@ -17,6 +17,7 @@ type Collector struct {
 	up 						*prometheus.Desc
 	mssqlInstanceLocalTime 	*prometheus.Desc
 	mssqlConnections 		*prometheus.Desc
+	mssqlDeadLocksPerSecond	*prometheus.Desc
 }
 
 // New is the constructor method of Collector
@@ -28,6 +29,7 @@ func New(db *sql.DB, log *logrus.Logger) *Collector {
 
 		mssqlInstanceLocalTime: prometheus.NewDesc("mssql_instance_local_time", "Number of seconds since epoch on local instance", nil, nil),
 		mssqlConnections: prometheus.NewDesc("mssql_connections", "Number of active connections", []string { "database", "state" }, nil),
+		mssqlDeadLocksPerSecond: prometheus.NewDesc("mssql_deadlocks", "Number of lock requests per second that resulted in a deadlock since last restart", nil, nil),
 	}
 }
 
@@ -39,6 +41,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 
 	ch <- c.mssqlInstanceLocalTime
 	ch <- c.mssqlConnections
+	ch <- c.mssqlDeadLocksPerSecond
 }
 
 // Collect is called by the Prometheus registry when collecting metrics.
@@ -51,14 +54,15 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	} else {
 		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 1)
 
-		collectLocalTime(c, ch)
-		collectConnections(c, ch)
+		collectLocalTimeMetric(c, ch)
+		collectConnectionsMetrics(c, ch)
+		collectDeadLocksMetric(c, ch)
 
 		c.log.Info("Scrape completed")
 	}
 }
 
-func collectLocalTime(c *Collector, ch chan<- prometheus.Metric) {
+func collectLocalTimeMetric(c *Collector, ch chan<- prometheus.Metric) {
 	rows := c.db.QueryRow("SELECT DATEDIFF(second, '19700101', GETUTCDATE())")
 	var localTime float64
 	
@@ -69,7 +73,7 @@ func collectLocalTime(c *Collector, ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.mssqlInstanceLocalTime, prometheus.GaugeValue, localTime)
 }
 
-func collectConnections(c *Collector, ch chan<- prometheus.Metric) {
+func collectConnectionsMetrics(c *Collector, ch chan<- prometheus.Metric) {
 	rows, err := c.db.Query("SELECT DB_NAME(sP.dbid), COUNT(sP.spid) FROM sys.sysprocesses sP GROUP BY DB_NAME(sP.dbid)")
 	if err != nil {
 		c.log.Fatal("Collect connection failed:", err.Error())
@@ -86,4 +90,15 @@ func collectConnections(c *Collector, ch chan<- prometheus.Metric) {
 
 		ch <- prometheus.MustNewConstMetric(c.mssqlConnections, prometheus.GaugeValue, connections, dbName, "current")
 	}
+}
+
+func collectDeadLocksMetric(c *Collector, ch chan<- prometheus.Metric) {
+	rows := c.db.QueryRow("SELECT cntr_value FROM sys.dm_os_performance_counters where counter_name = 'Number of Deadlocks/sec' AND instance_name = '_Total'")
+	var deadlocks float64
+	
+	if err := rows.Scan(&deadlocks); err != nil {
+		c.log.Fatal("DeadLocks scan failed:", err.Error())
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.mssqlDeadLocksPerSecond, prometheus.GaugeValue, deadlocks)
 }
