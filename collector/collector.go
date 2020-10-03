@@ -11,12 +11,12 @@ import (
 // Prometheus to collect metrics. A Collector has to be registered for
 // collection.
 type Collector struct {
-	db  *sql.DB
-	log *logrus.Logger
+	db  					*sql.DB
+	log 					*logrus.Logger
 
-	up *prometheus.Desc
-
-	mssqlInstanceLocalTime *prometheus.Desc
+	up 						*prometheus.Desc
+	mssqlInstanceLocalTime 	*prometheus.Desc
+	mssqlConnections 		*prometheus.Desc
 }
 
 // New is the constructor method of Collector
@@ -27,6 +27,7 @@ func New(db *sql.DB, log *logrus.Logger) *Collector {
 		up:  prometheus.NewDesc("mssql_up", "Whether the MSSQL scrape was successful", nil, nil),
 
 		mssqlInstanceLocalTime: prometheus.NewDesc("mssql_instance_local_time", "Number of seconds since epoch on local instance", nil, nil),
+		mssqlConnections: prometheus.NewDesc("mssql_connections", "Number of active connections", []string { "database", "state" }, nil),
 	}
 }
 
@@ -37,6 +38,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.up
 
 	ch <- c.mssqlInstanceLocalTime
+	ch <- c.mssqlConnections
 }
 
 // Collect is called by the Prometheus registry when collecting metrics.
@@ -50,17 +52,38 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 1)
 
 		collectLocalTime(c, ch)
+		collectConnections(c, ch)
 
 		c.log.Info("Scrape completed")
 	}
 }
 
-func collectLocalTime(c *Collector, ch chan<- prometheus.Metric)  {
+func collectLocalTime(c *Collector, ch chan<- prometheus.Metric) {
 	rows := c.db.QueryRow("SELECT DATEDIFF(second, '19700101', GETUTCDATE())")
 	var localTime float64
-	err := rows.Scan(&localTime)
-	if err != nil {
+	
+	if err := rows.Scan(&localTime); err != nil {
 		c.log.Fatal("LocalTine scan failed:", err.Error())
+		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.mssqlInstanceLocalTime, prometheus.GaugeValue, localTime)
+}
+
+func collectConnections(c *Collector, ch chan<- prometheus.Metric) {
+	rows, err := c.db.Query("SELECT DB_NAME(sP.dbid), COUNT(sP.spid) FROM sys.sysprocesses sP GROUP BY DB_NAME(sP.dbid)")
+	if err != nil {
+		c.log.Fatal("Collect connection failed:", err.Error())
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var dbName string
+		var connections float64
+		if err := rows.Scan(&dbName, &connections); err != nil {
+			c.log.Fatal("Collect connection scan failed:", err.Error())
+			return
+		}
+
+		ch <- prometheus.MustNewConstMetric(c.mssqlConnections, prometheus.GaugeValue, connections, dbName, "current")
+	}
 }
